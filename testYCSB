@@ -1,0 +1,165 @@
+#!/bin/bash
+#
+# Simple script; designed to execute YCSB on one client.
+# Helper scripts can launch this script on multiple nodes in parallel
+# to provide a more substantial workload against the table.
+#
+# usage: <SCRIPT> <workload> <insertStart> <insertCount> <loadFlag>
+#	All options have default values.
+#	<workload> : YCSB workload (lower case) : defaults to 'a'
+#	<insertStart> : start key for operations; 
+#		multiple clients should use different Start values.
+#	<insertCount> : operation count
+#	<loadFlag> : "-load" will trigger load part of test (defaults to "")
+#
+# examples :
+#       testYCSB c 0 100000 -load       # generate the dataset
+#       testYCSB c 0 100000             # test dataset with workload C
+#
+# design considerations
+#	Having a non-default client threads would be good ... but how to 
+#	arrange it on the command line given the loadFlag is not easy.
+#
+
+echo "Running testYCSB" "$@" " at "`date`" on "`hostname`
+
+# When invoked without a login shell, we may not have 
+# all the env settings we need
+#
+which java &> /dev/null
+if [ $? -ne 0 ] ; then
+	MAPR_HOME=/opt/mapr
+	MAPR_ENV=${MAPR_HOME}/conf/env.sh
+	[ -f ${MAPR_ENV} ] && . ${MAPR_ENV}
+	[ -n "${JAVA_HOME}:-" ] && PATH=$PATH:$JAVA_HOME/bin
+	[ -n "${MAPR_HOME}:-" ] && PATH=$PATH:$MAPR_HOME/bin
+fi
+
+
+# Split the load into multiple Java processes (perhaps), since
+# the YCSB client is so poorly written.  Best to 
+# have this be an even number .
+
+# Compute default thread count relative to number of cores
+#	We could pass this as an arg, but it's a pain with
+#	our support for the load option.
+ncpu=`grep ^processor /proc/cpuinfo | wc -l`
+defThreads=$[ncpu/2]
+
+if [ $ncpu -le 8 ] ; then
+	yProcs=1
+	yThreads=$[ncpu*2]
+elif [ $ncpu -le 16 ] ; then
+	yProcs=2
+	yThreads=$[ncpu/2]
+else
+	yProcs=4
+	yThreads=$[ncpu/2]
+fi
+
+# We should do a better job here of computing the count
+yLoad=${1:-c}
+iStart=${2:-100000000}
+iCount=${3:-20000000}
+loadFlag=${4:-}
+if [ -n "$4"  -a  $4 != ${4#-} ] ; then
+	loadFlag=${4:-}
+	clientFlag=${5:-}
+else
+	loadFlag=""
+	clientFlag=${4:-}
+fi
+
+# MapR Engineering prefers 1 proc with 8 threads for load
+if [ "$loadFlag" = "-load" ] ; then
+	yProcs=1
+	yThreads=8
+fi
+
+echo "$iStart" | grep -q -e "^[0123456789]"
+if [ $? -ne 0 ] ; then
+	iStart=0
+fi
+
+export yLoad iStart iCount yThreads keynameProp loadFlag
+
+# echo $yLoad $iStart $iCount $yThreads $keynameProp $loadFlag
+# exit
+
+
+YCSB_VER=0.1.4
+YCSB_TOP=$HOME/ycsb-${YCSB_VER}
+if [ ! -d $YCSB_TOP ] ; then
+	YCSB_TOP=`dirname $0`/YCSB
+fi
+
+if [ ! -d $YCSB_TOP ] ; then
+	echo "Can't locate YCSB_TOP; please install ycsb client properly"
+	exit 1
+fi
+
+YCSB_OUT=$HOME/ycsbout
+export YCSB_TOP YCSB_OUT
+mkdir -p $YCSB_OUT
+
+# We'll get away with passing "insertcount" and "operationcount", since the loadFlag value determines
+# which is used.
+
+HBASE_CLASSPATH=$YCSB_TOP/core/lib/core-${YCSB_VER}.jar:$YCSB_TOP/hbase-binding/lib/hbase-binding-${YCSB_VER}.jar ;
+HBASE_HEAPSIZE=4096
+HBASE_OPTS="-XX:+UseParNewGC -XX:NewRatio=4 -XX:MaxGCPauseMillis=100"
+export HBASE_CLASSPATH HBASE_HEAPSIZE;
+
+if [ $yProcs -eq 1 ] ; then
+	OUTFILE=$YCSB_OUT/ycsb${loadFlag:--output}.txt
+	rm -f $OUTFILE
+
+	hbase com.yahoo.ycsb.Client \
+  	  -threads $yThreads \
+  	  -db com.yahoo.ycsb.db.HBaseClient \
+  	  -P $YCSB_TOP/workloads/workload${yLoad} \
+  	  -p table=usertable \
+  	  -p columnfamily=family \
+  	  -p insertstart=$iStart \
+  	  -p insertcount=$iCount  \
+  	  -p operationcount=$iCount  \
+  	  -p fieldcount=10 \
+  	  -p fieldlength=100 \
+  	  $keynameProp \
+  	  $loadFlag \
+  	  -s > $OUTFILE
+
+else
+		# Launch multiple clients to cover the
+		# total insertCount requested (1/$yProcs per process)
+	iCount=$[iCount / $yProcs]
+	i=1
+	while [ $i -le $yProcs ] ; do
+		OUTFILE=$YCSB_OUT/ycsb${loadFlag:--output}_${i}.txt
+		rm -f $OUTFILE
+
+		echo "   Subjob $i: $yLoad $iStart $iCount $loadFlag"
+
+		hbase com.yahoo.ycsb.Client \
+  	  	   -threads $yThreads \
+  	  	   -db com.yahoo.ycsb.db.HBaseClient \
+		   -P $YCSB_TOP/workloads/workload${yLoad} \
+		   -p table=usertable \
+		   -p columnfamily=family \
+		   -p insertstart=$iStart \
+		   -p insertcount=$iCount  \
+		   -p operationcount=$iCount  \
+		   -p fieldcount=10 \
+		   -p fieldlength=100 \
+  	  	   $keynameProp \
+		   $loadFlag \
+		   -s > $OUTFILE &
+
+  	  	iStart=$[iStart + $iCount]
+		i=$[i+1]
+	done
+
+	wait
+	
+fi
+

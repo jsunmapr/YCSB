@@ -1,0 +1,1 @@
+sed -i 's/<\/configuration>/<property>\n<name>hbase.table.namespace.mappings<\/name>\n<value>*:\/tables<\/value>\n<\/property>\n<\/configuration>/g' /opt/mapr/hadoop/hadoop-2.5.1/etc/hadoop/core-site.xml
